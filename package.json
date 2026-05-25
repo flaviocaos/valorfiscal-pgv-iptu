@@ -1,0 +1,27 @@
+{
+  "name": "valorfiscal-pgv-iptu",
+  "version": "1.0.0",
+  "description": "Simulador municipal de PGV e IPTU — cálculo de Valor Venal, simulação individual e em lote, geração de functions PostgreSQL.",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "recharts": "^2.12.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": { "extends": ["react-app"] },
+  "browserslist": {
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version", "last 1 firefox version", "last 1 safari version"]
+  },
+  "keywords": ["pgv","iptu","simulador","valor-venal","tributario","municipal","react","postgresql"],
+  "author": "",
+  "license": "MIT",
+  "homepage": "."
+}
