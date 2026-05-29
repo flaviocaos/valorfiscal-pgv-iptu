@@ -884,109 +884,498 @@ function TabDetalhamento({params}){
   );
 }
 
+
 // ══════════════════════════════════════════════════════════════════════════════
-// ABA 6 — Exportar SQL
+// ABA 6 — Exportar SQL  (v3.0 — CRUD-first, sem trigger)
 // ══════════════════════════════════════════════════════════════════════════════
 function TabSQL({params}){
   const [schema,setSchema]=useState("gestao_cadastro_imobiliario");
+  const [activeTab,setActiveTab]=useState("estrutura"); // "estrutura" | "functions" | "crud"
   const [copied,setCopied]=useState(false);
   const today=new Date().toLocaleDateString("pt-BR");
   const cubCoefVal=params.cubCoef==="min"?params.cubMin:params.cubCoef==="max"?params.cubMax:params.cubMed;
 
-  const sql=`-- ================================================================
+  // ── SQL 1: Estrutura (tabelas) ─────────────────────────────────────────────
+  const sqlEstrutura=`-- ================================================================
+-- ValorFiscal — Estrutura de Tabelas
+-- Município : ${params.municipio}
+-- Schema    : ${schema}
+-- Gerado em : ${today}
+-- Versão    : 3.0
+-- ================================================================
+-- ESTRATÉGIA: CRUD-first (sem triggers)
+-- Os cálculos são disparados explicitamente pela aplicação,
+-- garantindo controle total sobre quando e como o PGV é recalculado.
+-- ================================================================
+
+-- 0. Schema (caso não exista)
+CREATE SCHEMA IF NOT EXISTS ${schema};
+
+-- ----------------------------------------------------------------
+-- 1. Parâmetros tributários municipais
+--    Centraliza alíquotas, CUB e descontos em uma única tabela.
+--    Quando a lei municipal mudar, basta fazer UPDATE aqui —
+--    sem redeployar nada, sem mexer em triggers.
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ${schema}.parametros_tributarios (
+  id                  SERIAL PRIMARY KEY,
+  municipio           TEXT    NOT NULL DEFAULT '${params.municipio}',
+  aliq_territorial    NUMERIC(6,4) NOT NULL DEFAULT ${params.aliqTerritorial},
+  aliq_predial        NUMERIC(6,4) NOT NULL DEFAULT ${params.aliqPredial},
+  desc_bruto_pct      NUMERIC(6,4) NOT NULL DEFAULT ${params.descBruto === 0 ? 100 : params.descBruto},
+  desc_predial_rs     NUMERIC(12,2) NOT NULL DEFAULT ${params.descPredial},
+  limite_aumento_pct  NUMERIC(6,4) NOT NULL DEFAULT ${params.limiteAumento},
+  cub_rs_m2           NUMERIC(10,2) NOT NULL DEFAULT ${params.cub},
+  cub_coef            NUMERIC(6,4) NOT NULL DEFAULT ${cubCoefVal},
+  vigencia_inicio     DATE NOT NULL DEFAULT CURRENT_DATE,
+  vigencia_fim        DATE,
+  ativo               BOOLEAN NOT NULL DEFAULT TRUE,
+  criado_em           TIMESTAMP NOT NULL DEFAULT NOW(),
+  atualizado_em       TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE ${schema}.parametros_tributarios IS
+  'Parâmetros tributários municipais. Sempre leia o registro com ativo=TRUE e vigencia_inicio mais recente.';
+
+-- Seed inicial com os parâmetros atuais do simulador
+INSERT INTO ${schema}.parametros_tributarios (
+  municipio, aliq_territorial, aliq_predial,
+  desc_bruto_pct, desc_predial_rs, limite_aumento_pct,
+  cub_rs_m2, cub_coef
+) VALUES (
+  '${params.municipio}',
+  ${params.aliqTerritorial}, ${params.aliqPredial},
+  ${params.descBruto === 0 ? 100 : params.descBruto}, ${params.descPredial},
+  ${params.limiteAumento}, ${params.cub}, ${cubCoefVal}
+) ON CONFLICT DO NOTHING;
+
+-- ----------------------------------------------------------------
+-- 2. Resultado do cálculo PGV por imóvel
+--    Gravado via CRUD pela aplicação — nunca por trigger.
+--    Cada recálculo gera um novo registro (histórico completo).
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ${schema}.pgv_resultado (
+  id              SERIAL PRIMARY KEY,
+  inscricao       TEXT    NOT NULL,
+  exercicio       INTEGER NOT NULL DEFAULT EXTRACT(YEAR FROM NOW()),
+  area_terreno    NUMERIC(12,4),
+  area_construida NUMERIC(12,4),
+  face_quadra     NUMERIC(12,4),
+  fracao_ideal    NUMERIC(8,6) DEFAULT 1,
+  vm2c            NUMERIC(12,2),
+  ft              NUMERIC(6,4) DEFAULT 1,
+  fp              NUMERIC(6,4) DEFAULT 1,
+  fl              NUMERIC(6,4) DEFAULT 1,
+  fce             NUMERIC(6,4) DEFAULT 1,
+  fator_gleba     NUMERIC(6,4) DEFAULT 1,
+  vvt             NUMERIC(14,2) NOT NULL DEFAULT 0,
+  vve             NUMERIC(14,2) NOT NULL DEFAULT 0,
+  vvi_bruto       NUMERIC(14,2) NOT NULL DEFAULT 0,
+  vvi_utilizado   NUMERIC(14,2) NOT NULL DEFAULT 0,
+  iptu_atual      NUMERIC(12,2) DEFAULT 0,
+  iptu_simulado   NUMERIC(12,2) NOT NULL DEFAULT 0,
+  variacao_pct    NUMERIC(8,2)  DEFAULT 0,
+  teto_atingido   BOOLEAN NOT NULL DEFAULT FALSE,
+  is_predial      BOOLEAN NOT NULL DEFAULT FALSE,
+  aliq_aplicada   NUMERIC(6,4),
+  id_parametro    INTEGER REFERENCES ${schema}.parametros_tributarios(id),
+  origem          TEXT DEFAULT 'simulador',  -- 'simulador' | 'lote' | 'api' | 'recadastro'
+  calculado_em    TIMESTAMP NOT NULL DEFAULT NOW(),
+  calculado_por   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pgv_inscricao
+  ON ${schema}.pgv_resultado(inscricao);
+CREATE INDEX IF NOT EXISTS idx_pgv_exercicio
+  ON ${schema}.pgv_resultado(exercicio);
+CREATE INDEX IF NOT EXISTS idx_pgv_inscricao_exercicio
+  ON ${schema}.pgv_resultado(inscricao, exercicio);
+
+COMMENT ON TABLE ${schema}.pgv_resultado IS
+  'Resultados do cálculo PGV/IPTU. Gravado via CRUD pela aplicação. ';
+COMMENT ON COLUMN ${schema}.pgv_resultado.origem IS
+  'simulador=interface web, lote=upload CSV, api=integração, recadastro=atualização cadastral';
+`;
+
+  // ── SQL 2: Functions ───────────────────────────────────────────────────────
+  const sqlFunctions=`-- ================================================================
 -- ValorFiscal — Functions PGV/IPTU
 -- Município : ${params.municipio}
 -- Schema    : ${schema}
 -- Gerado em : ${today}
--- Versão    : 2.0
+-- Versão    : 3.0
 -- ================================================================
 
-CREATE OR REPLACE FUNCTION ${schema}.alimentar_tabela_cadastro_pgv()
-RETURNS void LANGUAGE plpgsql AS $$
+-- ----------------------------------------------------------------
+-- F1: Lê parâmetros ativos do banco (não hardcoded)
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION ${schema}.__params_ativos()
+RETURNS ${schema}.parametros_tributarios LANGUAGE plpgsql STABLE AS $$
+DECLARE v_row ${schema}.parametros_tributarios;
 BEGIN
-  RAISE NOTICE '[PGV] Início — ${params.municipio}';
-  PERFORM pg_sleep(5);
-  RAISE NOTICE '[PGV] Etapa 1';
-  PERFORM pg_sleep(5);
-  RAISE NOTICE '[PGV] Etapa 2';
-  PERFORM pg_sleep(5);
-  RAISE NOTICE '[PGV] Concluído';
+  SELECT * INTO v_row FROM ${schema}.parametros_tributarios
+  WHERE ativo = TRUE
+    AND vigencia_inicio <= CURRENT_DATE
+    AND (vigencia_fim IS NULL OR vigencia_fim >= CURRENT_DATE)
+  ORDER BY vigencia_inicio DESC LIMIT 1;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION '[ValorFiscal] Nenhum parâmetro tributário ativo encontrado em ${schema}.parametros_tributarios';
+  END IF;
+  RETURN v_row;
 END; $$;
 
+-- ----------------------------------------------------------------
+-- F2: Cálculo do CUB para área construída
+-- ----------------------------------------------------------------
 CREATE OR REPLACE FUNCTION ${schema}.__calculo_cub(p_area_construida NUMERIC)
-RETURNS NUMERIC LANGUAGE plpgsql AS $$
+RETURNS NUMERIC LANGUAGE plpgsql STABLE AS $$
+DECLARE v_p ${schema}.parametros_tributarios;
 BEGIN
-  RETURN COALESCE(p_area_construida,0) * ${params.cub} * ${cubCoefVal};
+  v_p := ${schema}.__params_ativos();
+  RETURN COALESCE(p_area_construida, 0) * v_p.cub_rs_m2 * v_p.cub_coef;
 END; $$;
 
+-- ----------------------------------------------------------------
+-- F3: Motor de cálculo PGV/IPTU (lê parâmetros do banco)
+-- ----------------------------------------------------------------
 CREATE OR REPLACE FUNCTION ${schema}.__calculo_pgv(
-  p_area_terreno NUMERIC, p_face_quadra NUMERIC,
-  p_fracao_ideal NUMERIC DEFAULT 1, p_area_construida NUMERIC DEFAULT 0,
-  p_vm2c NUMERIC DEFAULT NULL, p_qtd_unidades INTEGER DEFAULT 1,
-  p_ft NUMERIC DEFAULT 1, p_fp NUMERIC DEFAULT 1,
-  p_fl NUMERIC DEFAULT 1, p_fce NUMERIC DEFAULT 1,
-  p_iptu_atual NUMERIC DEFAULT 0
-) RETURNS TABLE(vvt NUMERIC,vve NUMERIC,vvi_bruto NUMERIC,
-  vvi_utilizado NUMERIC,iptu_simulado NUMERIC,variacao_pct NUMERIC,teto_atingido BOOLEAN)
-LANGUAGE plpgsql AS $$
+  p_area_terreno    NUMERIC,
+  p_face_quadra     NUMERIC,
+  p_fracao_ideal    NUMERIC  DEFAULT 1,
+  p_area_construida NUMERIC  DEFAULT 0,
+  p_vm2c            NUMERIC  DEFAULT NULL,
+  p_qtd_unidades    INTEGER  DEFAULT 1,
+  p_ft              NUMERIC  DEFAULT 1,
+  p_fp              NUMERIC  DEFAULT 1,
+  p_fl              NUMERIC  DEFAULT 1,
+  p_fce             NUMERIC  DEFAULT 1,
+  p_iptu_atual      NUMERIC  DEFAULT 0
+) RETURNS TABLE(
+  vvt           NUMERIC,
+  vve           NUMERIC,
+  vvi_bruto     NUMERIC,
+  vvi_utilizado NUMERIC,
+  iptu_simulado NUMERIC,
+  variacao_pct  NUMERIC,
+  teto_atingido BOOLEAN,
+  fator_gleba   NUMERIC,
+  is_predial    BOOLEAN,
+  aliq_aplicada NUMERIC,
+  id_parametro  INTEGER
+) LANGUAGE plpgsql STABLE AS $$
 DECLARE
-  v_gleba NUMERIC; v_fg NUMERIC:=1.0;
-  v_vvt NUMERIC:=0; v_vve NUMERIC:=0; v_vvi NUMERIC;
-  v_db NUMERIC:=${params.descBruto===0?100:params.descBruto};
-  v_dp NUMERIC:=${params.descPredial};
-  v_ap NUMERIC:=${params.aliqPredial}; v_at NUMERIC:=${params.aliqTerritorial};
-  v_lim NUMERIC:=${params.limiteAumento};
-  v_util NUMERIC; v_iptu NUMERIC; v_teto BOOLEAN:=FALSE; v_var NUMERIC:=0;
+  v_p   ${schema}.parametros_tributarios;
+  v_gleba NUMERIC; v_fg NUMERIC := 1.0;
+  v_vvt NUMERIC := 0; v_vve NUMERIC := 0; v_vvi NUMERIC;
+  v_util NUMERIC; v_iptu NUMERIC; v_teto BOOLEAN := FALSE; v_var NUMERIC := 0;
+  v_vm2c NUMERIC; v_is_pred BOOLEAN; v_aliq NUMERIC;
 BEGIN
-  IF COALESCE(p_area_terreno,0)>0 AND COALESCE(p_face_quadra,0)>0 THEN
-    v_gleba:=p_area_terreno*COALESCE(p_fracao_ideal,1);
-    IF v_gleba>2000 THEN
-      v_fg:=CASE WHEN v_gleba<=4000 THEN 0.6 WHEN v_gleba<=10000 THEN 0.5
-                 WHEN v_gleba<=20000 THEN 0.4 WHEN v_gleba<=50000 THEN 0.25 ELSE 0.20 END;
+  -- Lê parâmetros do banco — nunca hardcoded
+  v_p := ${schema}.__params_ativos();
+
+  -- VVT
+  IF COALESCE(p_area_terreno, 0) > 0 AND COALESCE(p_face_quadra, 0) > 0 THEN
+    v_gleba := p_area_terreno * COALESCE(p_fracao_ideal, 1);
+    IF v_gleba > 2000 THEN
+      v_fg := CASE
+        WHEN v_gleba <= 4000  THEN 0.6
+        WHEN v_gleba <= 10000 THEN 0.5
+        WHEN v_gleba <= 20000 THEN 0.4
+        WHEN v_gleba <= 50000 THEN 0.25
+        ELSE 0.20
+      END;
     END IF;
-    v_vvt:=p_area_terreno*p_face_quadra*COALESCE(p_ft,1)*COALESCE(p_fp,1)*COALESCE(p_fl,1)*COALESCE(p_fracao_ideal,1)*v_fg;
+    v_vvt := p_area_terreno * p_face_quadra
+           * COALESCE(p_ft, 1) * COALESCE(p_fp, 1) * COALESCE(p_fl, 1)
+           * COALESCE(p_fracao_ideal, 1) * v_fg;
   END IF;
-  IF COALESCE(p_area_construida,0)>0 THEN
-    v_vve:=p_area_construida*COALESCE(p_vm2c,${schema}.__calculo_cub(p_area_construida)/NULLIF(p_area_construida,0))*COALESCE(p_fce,1);
+
+  -- VVE
+  IF COALESCE(p_area_construida, 0) > 0 THEN
+    v_vm2c := COALESCE(p_vm2c,
+      ${schema}.__calculo_cub(p_area_construida) / NULLIF(p_area_construida, 0));
+    v_vve := p_area_construida * v_vm2c * COALESCE(p_fce, 1);
   END IF;
-  v_vvi:=v_vvt+v_vve;
-  v_util:=GREATEST((v_vvi*(v_db/100.0))-(v_dp/GREATEST(COALESCE(p_qtd_unidades,1),1)),0);
-  IF COALESCE(p_area_construida,0)>0 THEN v_iptu:=v_util*v_ap/100.0;
-  ELSE v_iptu:=v_util*v_at/100.0; END IF;
-  IF COALESCE(p_iptu_atual,0)>0 AND v_lim>0 THEN
-    IF v_iptu>p_iptu_atual*(1+v_lim/100.0) THEN v_iptu:=p_iptu_atual*(1+v_lim/100.0);v_teto:=TRUE; END IF;
+
+  -- VVI e descontos
+  v_vvi  := v_vvt + v_vve;
+  v_util := GREATEST(
+    (v_vvi * (v_p.desc_bruto_pct / 100.0))
+    - (v_p.desc_predial_rs / GREATEST(COALESCE(p_qtd_unidades, 1), 1)),
+    0
+  );
+
+  -- Alíquota
+  v_is_pred := COALESCE(p_area_construida, 0) > 0;
+  v_aliq    := CASE WHEN v_is_pred THEN v_p.aliq_predial ELSE v_p.aliq_territorial END;
+  v_iptu    := v_util * v_aliq / 100.0;
+
+  -- Teto de aumento
+  IF COALESCE(p_iptu_atual, 0) > 0 AND v_p.limite_aumento_pct > 0 THEN
+    IF v_iptu > p_iptu_atual * (1 + v_p.limite_aumento_pct / 100.0) THEN
+      v_iptu := p_iptu_atual * (1 + v_p.limite_aumento_pct / 100.0);
+      v_teto := TRUE;
+    END IF;
   END IF;
-  IF COALESCE(p_iptu_atual,0)>0 THEN v_var:=((v_iptu-p_iptu_atual)/p_iptu_atual)*100.0; END IF;
-  RETURN QUERY SELECT v_vvt,v_vve,v_vvi,v_util,v_iptu,v_var,v_teto;
+
+  -- Variação
+  IF COALESCE(p_iptu_atual, 0) > 0 THEN
+    v_var := ((v_iptu - p_iptu_atual) / p_iptu_atual) * 100.0;
+  END IF;
+
+  RETURN QUERY SELECT
+    v_vvt, v_vve, v_vvi, v_util, v_iptu, v_var,
+    v_teto, v_fg, v_is_pred, v_aliq, v_p.id;
 END; $$;
 
+-- ----------------------------------------------------------------
+-- F4: Soma IPTU de um imóvel no exercício atual
+-- ----------------------------------------------------------------
 CREATE OR REPLACE FUNCTION ${schema}.__somar_iptu(p_inscricao TEXT)
-RETURNS NUMERIC LANGUAGE plpgsql AS $$
+RETURNS NUMERIC LANGUAGE plpgsql STABLE AS $$
 DECLARE v_total NUMERIC;
 BEGIN
-  SELECT COALESCE(SUM(iptu_simulado),0) INTO v_total
-  FROM ${schema}.pgv_resultado WHERE inscricao=p_inscricao;
+  SELECT COALESCE(SUM(iptu_simulado), 0) INTO v_total
+  FROM ${schema}.pgv_resultado
+  WHERE inscricao = p_inscricao
+    AND exercicio = EXTRACT(YEAR FROM NOW());
   RETURN v_total;
 END; $$;
 
-CREATE OR REPLACE FUNCTION ${schema}.__calculo_diferenca_iptu(p_atual NUMERIC,p_simulado NUMERIC)
-RETURNS NUMERIC LANGUAGE plpgsql AS $$
+-- ----------------------------------------------------------------
+-- F5: Variação percentual entre dois valores
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION ${schema}.__calculo_diferenca_iptu(
+  p_atual NUMERIC, p_simulado NUMERIC
+) RETURNS NUMERIC LANGUAGE plpgsql IMMUTABLE AS $$
 BEGIN
-  IF COALESCE(p_atual,0)=0 THEN RETURN NULL; END IF;
-  RETURN ROUND(((p_simulado-p_atual)/p_atual)*100.0,2);
+  IF COALESCE(p_atual, 0) = 0 THEN RETURN NULL; END IF;
+  RETURN ROUND(((p_simulado - p_atual) / p_atual) * 100.0, 2);
 END; $$;
 
--- FIM — ${params.municipio} — ${today}`;
+-- ----------------------------------------------------------------
+-- F6: Recalcula e grava resultado via CRUD (sem trigger)
+--     Chame esta function na sua aplicação ao salvar/atualizar imóvel
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION ${schema}.calcular_e_gravar_pgv(
+  p_inscricao       TEXT,
+  p_area_terreno    NUMERIC,
+  p_face_quadra     NUMERIC,
+  p_fracao_ideal    NUMERIC  DEFAULT 1,
+  p_area_construida NUMERIC  DEFAULT 0,
+  p_vm2c            NUMERIC  DEFAULT NULL,
+  p_qtd_unidades    INTEGER  DEFAULT 1,
+  p_ft              NUMERIC  DEFAULT 1,
+  p_fp              NUMERIC  DEFAULT 1,
+  p_fl              NUMERIC  DEFAULT 1,
+  p_fce             NUMERIC  DEFAULT 1,
+  p_iptu_atual      NUMERIC  DEFAULT 0,
+  p_origem          TEXT     DEFAULT 'api',
+  p_calculado_por   TEXT     DEFAULT NULL
+) RETURNS ${schema}.pgv_resultado LANGUAGE plpgsql AS $$
+DECLARE
+  v_calc  RECORD;
+  v_row   ${schema}.pgv_resultado;
+BEGIN
+  -- Executa o motor de cálculo
+  SELECT * INTO v_calc FROM ${schema}.__calculo_pgv(
+    p_area_terreno, p_face_quadra, p_fracao_ideal, p_area_construida,
+    p_vm2c, p_qtd_unidades, p_ft, p_fp, p_fl, p_fce, p_iptu_atual
+  );
+
+  -- Grava o resultado (CRUD — sem trigger)
+  INSERT INTO ${schema}.pgv_resultado (
+    inscricao, exercicio,
+    area_terreno, area_construida, face_quadra, fracao_ideal,
+    vm2c, ft, fp, fl, fce, fator_gleba,
+    vvt, vve, vvi_bruto, vvi_utilizado,
+    iptu_atual, iptu_simulado, variacao_pct, teto_atingido,
+    is_predial, aliq_aplicada, id_parametro,
+    origem, calculado_por
+  ) VALUES (
+    p_inscricao, EXTRACT(YEAR FROM NOW()),
+    p_area_terreno, p_area_construida, p_face_quadra, p_fracao_ideal,
+    COALESCE(p_vm2c, v_calc.vve / NULLIF(p_area_construida, 0)),
+    p_ft, p_fp, p_fl, p_fce, v_calc.fator_gleba,
+    v_calc.vvt, v_calc.vve, v_calc.vvi_bruto, v_calc.vvi_utilizado,
+    p_iptu_atual, v_calc.iptu_simulado, v_calc.variacao_pct, v_calc.teto_atingido,
+    v_calc.is_predial, v_calc.aliq_aplicada, v_calc.id_parametro,
+    p_origem, p_calculado_por
+  ) RETURNING * INTO v_row;
+
+  RETURN v_row;
+END; $$;
+
+-- FIM FUNCTIONS — ${params.municipio} — ${today}
+`;
+
+  // ── SQL 3: Exemplo de uso CRUD ─────────────────────────────────────────────
+  const sqlCrud=`-- ================================================================
+-- ValorFiscal — Exemplos de Uso CRUD
+-- Município : ${params.municipio}
+-- Schema    : ${schema}
+-- Gerado em : ${today}
+-- ================================================================
+-- IMPORTANTE: NUNCA use trigger para disparar __calculo_pgv().
+-- Chame calcular_e_gravar_pgv() explicitamente na sua aplicação
+-- ao salvar, atualizar ou recadastrar um imóvel.
+-- ================================================================
+
+-- ----------------------------------------------------------------
+-- EXEMPLO 1: Calcular e gravar um imóvel predial
+-- ----------------------------------------------------------------
+SELECT * FROM ${schema}.calcular_e_gravar_pgv(
+  p_inscricao       := '1.01.001.0001.00',
+  p_area_terreno    := 300,
+  p_face_quadra     := 800,
+  p_fracao_ideal    := 1,
+  p_area_construida := 150,
+  p_vm2c            := NULL,   -- NULL = usa CUB do banco automaticamente
+  p_qtd_unidades    := 1,
+  p_ft              := 1.0,    -- Plano
+  p_fp              := 1.0,    -- Firme e seco
+  p_fl              := 1.0,    -- Meio de quadra
+  p_fce             := 0.85,   -- Bom estado de conservação
+  p_iptu_atual      := 1200,
+  p_origem          := 'recadastro',
+  p_calculado_por   := 'sistema_sig'
+);
+
+-- ----------------------------------------------------------------
+-- EXEMPLO 2: Calcular e gravar um imóvel territorial (sem construção)
+-- ----------------------------------------------------------------
+SELECT * FROM ${schema}.calcular_e_gravar_pgv(
+  p_inscricao       := '1.01.002.0003.00',
+  p_area_terreno    := 500,
+  p_face_quadra     := 600,
+  p_fracao_ideal    := 1,
+  p_area_construida := 0,      -- Sem edificação = alíquota territorial
+  p_iptu_atual      := 400,
+  p_origem          := 'lote',
+  p_calculado_por   := 'importacao_csv'
+);
+
+-- ----------------------------------------------------------------
+-- EXEMPLO 3: Recalcular lote de imóveis via loop (uso em batch)
+-- ----------------------------------------------------------------
+DO $$
+DECLARE
+  v_imovel RECORD;
+BEGIN
+  FOR v_imovel IN
+    SELECT inscricao, area_terreno, face_quadra, fracao_ideal,
+           area_construida, vm2c, qtd_unidades,
+           ft, fp, fl, fce, iptu_atual
+    FROM cadastro_imobiliario   -- sua tabela de cadastro
+    WHERE recadastrado_em >= CURRENT_DATE - 30  -- apenas os alterados
+  LOOP
+    PERFORM ${schema}.calcular_e_gravar_pgv(
+      p_inscricao       := v_imovel.inscricao,
+      p_area_terreno    := v_imovel.area_terreno,
+      p_face_quadra     := v_imovel.face_quadra,
+      p_fracao_ideal    := v_imovel.fracao_ideal,
+      p_area_construida := v_imovel.area_construida,
+      p_vm2c            := v_imovel.vm2c,
+      p_qtd_unidades    := v_imovel.qtd_unidades,
+      p_ft              := v_imovel.ft,
+      p_fp              := v_imovel.fp,
+      p_fl              := v_imovel.fl,
+      p_fce             := v_imovel.fce,
+      p_iptu_atual      := v_imovel.iptu_atual,
+      p_origem          := 'batch_recadastro',
+      p_calculado_por   := current_user
+    );
+  END LOOP;
+  RAISE NOTICE 'Recálculo em lote concluído';
+END; $$;
+
+-- ----------------------------------------------------------------
+-- EXEMPLO 4: Atualizar parâmetros quando a lei mudar
+--            (sem mexer em trigger ou redeployar nada)
+-- ----------------------------------------------------------------
+-- Desativa parâmetro atual
+UPDATE ${schema}.parametros_tributarios
+SET ativo = FALSE, vigencia_fim = CURRENT_DATE - 1
+WHERE ativo = TRUE;
+
+-- Insere novo parâmetro (ex: reajuste de alíquota predial aprovado em lei)
+INSERT INTO ${schema}.parametros_tributarios (
+  municipio, aliq_territorial, aliq_predial,
+  desc_bruto_pct, desc_predial_rs, limite_aumento_pct,
+  cub_rs_m2, cub_coef, vigencia_inicio
+) VALUES (
+  '${params.municipio}',
+  ${params.aliqTerritorial},   -- alíquota territorial (mantida)
+  0.60,                         -- alíquota predial (atualizada por lei)
+  ${params.descBruto === 0 ? 100 : params.descBruto},
+  ${params.descPredial},
+  ${params.limiteAumento},
+  ${params.cub},
+  ${cubCoefVal},
+  CURRENT_DATE                  -- vigência a partir de hoje
+);
+-- A partir deste ponto, qualquer chamada a calcular_e_gravar_pgv()
+-- usará automaticamente os novos parâmetros. Zero redeploy.
+
+-- ----------------------------------------------------------------
+-- CONSULTAS ÚTEIS
+-- ----------------------------------------------------------------
+
+-- Total arrecadado simulado por exercício
+SELECT exercicio,
+       COUNT(*)                           AS total_imoveis,
+       SUM(iptu_atual)                    AS arrecadacao_atual,
+       SUM(iptu_simulado)                 AS arrecadacao_simulada,
+       SUM(iptu_simulado - iptu_atual)    AS impacto,
+       AVG(variacao_pct)                  AS variacao_media_pct,
+       SUM(CASE WHEN teto_atingido THEN 1 ELSE 0 END) AS com_teto
+FROM ${schema}.pgv_resultado
+GROUP BY exercicio ORDER BY exercicio DESC;
+
+-- Histórico de um imóvel específico
+SELECT exercicio, iptu_atual, iptu_simulado, variacao_pct,
+       teto_atingido, origem, calculado_em
+FROM ${schema}.pgv_resultado
+WHERE inscricao = '1.01.001.0001.00'
+ORDER BY calculado_em DESC;
+
+-- FIM EXEMPLOS CRUD — ${params.municipio} — ${today}
+`;
+
+  const sqlMap = { estrutura: sqlEstrutura, functions: sqlFunctions, crud: sqlCrud };
+  const currentSql = sqlMap[activeTab];
 
   const download=()=>{
-    const blob=new Blob([sql],{type:"text/plain"});
+    const blob=new Blob([currentSql],{type:"text/plain"});
     const a=document.createElement("a");a.href=URL.createObjectURL(blob);
-    a.download=`pgv_${params.municipio.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"")}.sql`;a.click();
+    a.download=`pgv_${activeTab}_${params.municipio.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"")}.sql`;a.click();
   };
-  const copy=()=>{navigator.clipboard.writeText(sql).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);});};
+  const downloadAll=()=>{
+    const all=[sqlEstrutura,sqlFunctions,sqlCrud].join("\n\n");
+    const blob=new Blob([all],{type:"text/plain"});
+    const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+    a.download=`pgv_completo_${params.municipio.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"")}.sql`;a.click();
+  };
+  const copy=()=>{navigator.clipboard.writeText(currentSql).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);});};
+
+  const tabLabels=[
+    {id:"estrutura",  label:"1. Tabelas",    sub:"pgv_resultado + parametros_tributarios"},
+    {id:"functions",  label:"2. Functions",  sub:"6 functions (lê params do banco)"},
+    {id:"crud",       label:"3. Uso CRUD",   sub:"Exemplos sem trigger"},
+  ];
 
   return(
     <div style={{display:"flex",flexDirection:"column",gap:16}}>
+
+      {/* Alerta estratégico */}
+      <div style={{background:"#EAF3DE",border:"1.5px solid #7BBF4A",borderRadius:12,padding:"12px 18px",fontSize:13,color:"#2D5A0E",display:"flex",gap:10,alignItems:"flex-start"}}>
+        <span style={{fontSize:18,flexShrink:0}}>✅</span>
+        <div>
+          <strong>CRUD-first — sem trigger.</strong> Os parâmetros tributários ficam na tabela <code style={{background:"#D4EDBA",padding:"1px 5px",borderRadius:4}}>parametros_tributarios</code>. Quando a lei mudar, basta um UPDATE — zero redeploy, zero mexer em trigger. O motor <code style={{background:"#D4EDBA",padding:"1px 5px",borderRadius:4}}>calcular_e_gravar_pgv()</code> é chamado explicitamente pela aplicação ao salvar ou atualizar um imóvel.
+        </div>
+      </div>
+
+      {/* Config */}
       <section style={{background:"var(--card)",borderRadius:14,padding:22,boxShadow:"0 1px 6px var(--shadow)",border:"1.5px solid var(--border)"}}>
         <div style={{fontWeight:700,marginBottom:14,fontSize:14}}>Configurações</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
@@ -999,16 +1388,51 @@ END; $$;
           ))}
         </div>
       </section>
+
+      {/* Sub-tabs */}
       <section style={{background:"var(--card)",borderRadius:14,padding:20,boxShadow:"0 1px 6px var(--shadow)",border:"1.5px solid var(--border)"}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}}>
-          <div style={{fontWeight:700,fontSize:14}}>Preview SQL — 5 Functions</div>
-          <div style={{display:"flex",gap:10}}>
-            <Btn icon={copied?"check":"copy"} outline color={copied?C.green:C.primary} onClick={copy}>{copied?"Copiado!":"Copiar"}</Btn>
-            <Btn icon="download" onClick={download}>Baixar .sql</Btn>
+        <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+          {tabLabels.map(t=>(
+            <button key={t.id} onClick={()=>{setActiveTab(t.id);setCopied(false);}}
+              style={{display:"flex",flexDirection:"column",alignItems:"flex-start",padding:"8px 14px",borderRadius:9,border:`1.5px solid ${activeTab===t.id?C.primary:"var(--border)"}`,background:activeTab===t.id?C.light:"transparent",cursor:"pointer",minWidth:160}}>
+              <span style={{fontWeight:700,fontSize:12,color:activeTab===t.id?C.primary:"var(--text)"}}>{t.label}</span>
+              <span style={{fontSize:10,color:"var(--muted)",marginTop:1}}>{t.sub}</span>
+            </button>
+          ))}
+        </div>
+
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:10}}>
+          <div style={{fontWeight:700,fontSize:13}}>
+            {activeTab==="estrutura"&&"Tabelas — pgv_resultado + parametros_tributarios"}
+            {activeTab==="functions"&&"6 Functions PostgreSQL (leem params do banco)"}
+            {activeTab==="crud"&&"Exemplos de uso CRUD — sem trigger"}
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <Btn icon={copied?"check":"copy"} outline color={copied?C.green:C.primary} small onClick={copy}>{copied?"Copiado!":"Copiar"}</Btn>
+            <Btn icon="download" small onClick={download}>Este arquivo</Btn>
+            <Btn icon="download" color={C.green} small onClick={downloadAll}>Tudo (.sql)</Btn>
           </div>
         </div>
-        <pre style={{background:"var(--code-bg)",borderRadius:10,padding:18,fontSize:11,lineHeight:1.65,overflowX:"auto",overflowY:"auto",maxHeight:520,color:"var(--code-text)",margin:0,fontFamily:"'Fira Code','Cascadia Code','Consolas',monospace",whiteSpace:"pre"}}>{sql}</pre>
+
+        <pre style={{background:"var(--code-bg)",borderRadius:10,padding:18,fontSize:11,lineHeight:1.65,overflowX:"auto",overflowY:"auto",maxHeight:520,color:"var(--code-text)",margin:0,fontFamily:"'Fira Code','Cascadia Code','Consolas',monospace",whiteSpace:"pre"}}>{currentSql}</pre>
       </section>
+
+      {/* Ordem de execução */}
+      <section style={{background:"var(--card)",borderRadius:14,padding:20,boxShadow:"0 1px 6px var(--shadow)",border:"1.5px solid var(--border)"}}>
+        <div style={{fontWeight:700,fontSize:13,marginBottom:12}}>Ordem de execução no banco</div>
+        {[
+          {n:"1",t:"Tabelas",c:"Execute o SQL da aba Tabelas primeiro — cria pgv_resultado e parametros_tributarios com os valores atuais do simulador."},
+          {n:"2",t:"Functions",c:"Execute o SQL da aba Functions — as 6 functions já leem os parâmetros do banco, não têm valores hardcoded."},
+          {n:"3",t:"Integrar na aplicação",c:"Na sua API/backend, substitua qualquer trigger por uma chamada explícita a calcular_e_gravar_pgv() ao salvar ou atualizar um imóvel."},
+          {n:"4",t:"Mudança de lei",c:"Quando alíquotas ou CUB mudarem: desative o registro atual em parametros_tributarios e insira o novo. Zero redeploy."},
+        ].map((s,i)=>(
+          <div key={i} style={{display:"flex",gap:12,padding:"10px 0",borderBottom:i<3?"1px solid var(--border)":"none"}}>
+            <div style={{background:C.light,color:C.primary,borderRadius:6,width:24,height:24,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:12,flexShrink:0}}>{s.n}</div>
+            <div><div style={{fontWeight:600,fontSize:13,marginBottom:2}}>{s.t}</div><div style={{fontSize:12,color:"var(--muted)",lineHeight:1.5}}>{s.c}</div></div>
+          </div>
+        ))}
+      </section>
+
     </div>
   );
 }
